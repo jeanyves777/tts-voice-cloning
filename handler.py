@@ -1,411 +1,281 @@
 #!/usr/bin/env python3
 """
-F5-TTS + OpenVoice RunPod Serverless Handler
-Multilingual TTS with voice cloning capabilities
+F5-TTS RunPod Serverless Handler (Simplified)
+Multilingual TTS with voice cloning
 NO sys.exit() - proper error handling
 """
 
 import runpod
 import os
-import sys
-import json
 import torch
 import torchaudio
 import tempfile
 import shutil
 from pathlib import Path
 import requests
+import traceback
 
-print("[TTS] Initializing F5-TTS + OpenVoice handler...")
+print("[TTS] Starting F5-TTS handler...")
 
-# Add to Python path
-sys.path.insert(0, '/workspace/F5-TTS')
-sys.path.insert(0, '/workspace/OpenVoice')
+# S3 Configuration
+S3_ACCESS_KEY = os.environ.get('RUNPOD_S3_ACCESS_KEY')
+S3_SECRET_KEY = os.environ.get('RUNPOD_S3_SECRET_KEY')
+S3_BUCKET = os.environ.get('RUNPOD_S3_BUCKET', 'flowsmartly-avatars')
+S3_ENDPOINT = os.environ.get('RUNPOD_S3_ENDPOINT', 'https://storage.runpod.io')
 
-# Configuration
-WORKSPACE = Path("/workspace")
-F5_DIR = WORKSPACE / "F5-TTS"
-OPENVOICE_DIR = WORKSPACE / "OpenVoice"
-CACHE_DIR = WORKSPACE / ".cache"
+# Import S3 client if credentials available
+s3_client = None
+if S3_ACCESS_KEY and S3_SECRET_KEY:
+    try:
+        import boto3
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY
+        )
+        print("[S3] ✅ S3 client initialized")
+    except Exception as e:
+        print(f"[S3] ⚠️ S3 client failed: {e}")
 
-# Create cache directory
-CACHE_DIR.mkdir(exist_ok=True)
-
-# Global models (loaded once at startup)
+# Global model (loaded once)
 f5_model = None
-f5_vocab = None
-openvoice_model = None
-tone_converter = None
 
 def initialize_f5_tts():
     """Initialize F5-TTS model"""
-    global f5_model, f5_vocab
+    global f5_model
+
+    if f5_model is not None:
+        return True
 
     try:
         print("[F5-TTS] Loading model...")
+
+        # Import F5-TTS
         from f5_tts.api import F5TTS
 
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[F5-TTS] Using device: {device}")
+
+        # Initialize model
         f5_model = F5TTS(
             model_type="F5-TTS",
-            ckpt_file=None,  # Use default checkpoint
-            vocab_file=None,
+            ckpt_file=None,  # Use default
+            vocab_file=None,  # Use default
             ode_method="euler",
             use_ema=True,
-            device="cuda" if torch.cuda.is_available() else "cpu"
+            device=device
         )
 
-        print(f"[F5-TTS] ✅ Model loaded on {f5_model.device}")
+        print(f"[F5-TTS] ✅ Model loaded successfully")
         return True
 
     except Exception as e:
-        print(f"[F5-TTS] ⚠️ Failed to load: {e}")
+        print(f"[F5-TTS] ❌ Failed to load: {e}")
+        traceback.print_exc()
         return False
-
-def initialize_openvoice():
-    """Initialize OpenVoice model"""
-    global openvoice_model, tone_converter
-
-    try:
-        print("[OpenVoice] Loading model...")
-        from openvoice import se_extractor
-        from openvoice.api import ToneColorConverter
-
-        ckpt_converter = str(OPENVOICE_DIR / "checkpoints" / "converter")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        tone_converter = ToneColorConverter(f'{ckpt_converter}/config.json', device=device)
-        tone_converter.load_ckpt(f'{ckpt_converter}/checkpoint.pth')
-
-        print(f"[OpenVoice] ✅ Model loaded on {device}")
-        return True
-
-    except Exception as e:
-        print(f"[OpenVoice] ⚠️ Failed to load: {e}")
-        return False
-
-# Initialize models at startup
-print("[TTS] Initializing models...")
-f5_initialized = initialize_f5_tts()
-openvoice_initialized = initialize_openvoice()
-
-if not f5_initialized:
-    print("[TTS] ⚠️ F5-TTS not available - will try to load on first request")
-if not openvoice_initialized:
-    print("[TTS] ⚠️ OpenVoice not available - will try to load on first request")
 
 def download_file(url, local_path):
     """Download file from URL"""
     try:
-        print(f"[TTS] Downloading: {url}")
-        response = requests.get(url, stream=True, timeout=60)
+        print(f"[Download] {url}")
+        response = requests.get(url, stream=True, timeout=120)
         response.raise_for_status()
 
         with open(local_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+                f.write(chunk)
 
-        print(f"[TTS] Downloaded: {local_path}")
-        return str(local_path), None
+        print(f"[Download] ✅ Saved to {local_path}")
+        return local_path, None
 
     except Exception as e:
-        return None, f"Download failed: {str(e)}"
+        error = f"Download failed: {str(e)}"
+        print(f"[Download] ❌ {error}")
+        return None, error
 
-def upload_to_s3(file_path, bucket_name, object_name):
+def upload_to_s3(local_path, object_name=None):
     """Upload file to S3"""
+    if not s3_client:
+        return None, "S3 not configured"
+
     try:
-        import boto3
-        from botocore.client import Config
+        if object_name is None:
+            object_name = f"tts-output/{Path(local_path).name}"
 
-        endpoint_url = os.getenv('RUNPOD_S3_ENDPOINT', 'https://storage.runpod.io')
-        access_key = os.getenv('RUNPOD_S3_ACCESS_KEY')
-        secret_key = os.getenv('RUNPOD_S3_SECRET_KEY')
+        print(f"[S3] Uploading to {S3_BUCKET}/{object_name}")
 
-        if not access_key or not secret_key:
-            return None, "S3 credentials not configured"
-
-        s3_client = boto3.client(
-            's3',
-            endpoint_url=endpoint_url,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            config=Config(signature_version='s3v4')
+        s3_client.upload_file(
+            local_path,
+            S3_BUCKET,
+            object_name,
+            ExtraArgs={'ACL': 'public-read'}
         )
 
-        s3_client.upload_file(str(file_path), bucket_name, object_name)
-        url = f"{endpoint_url}/{bucket_name}/{object_name}"
-
-        print(f"[TTS] Uploaded to: {url}")
+        url = f"{S3_ENDPOINT}/{S3_BUCKET}/{object_name}"
+        print(f"[S3] ✅ Uploaded: {url}")
         return url, None
 
     except Exception as e:
-        return None, f"S3 upload failed: {str(e)}"
+        error = f"S3 upload failed: {str(e)}"
+        print(f"[S3] ❌ {error}")
+        return None, error
 
-def generate_f5_tts(text, ref_audio_path=None, ref_text=None, language="en"):
+def generate_tts(text, language="en", ref_audio=None, ref_text=None):
     """
-    Generate speech using F5-TTS
+    Generate TTS audio
 
     Args:
         text: Text to synthesize
-        ref_audio_path: Optional reference audio for voice cloning
-        ref_text: Optional reference text (transcript of ref_audio)
-        language: Language code (en, zh, es, etc.)
+        language: Language code (en, es, fr, etc.)
+        ref_audio: Path to reference audio for voice cloning (optional)
+        ref_text: Transcript of reference audio (optional)
+
+    Returns:
+        (audio_path, error)
     """
-    global f5_model
-
     try:
-        # Lazy load if not initialized
-        if f5_model is None:
-            if not initialize_f5_tts():
-                return None, "F5-TTS model not available"
+        # Ensure model is loaded
+        if not initialize_f5_tts():
+            return None, "F5-TTS model not available"
 
-        print(f"[F5-TTS] Generating speech...")
-        print(f"  Text: {text[:50]}...")
-        print(f"  Language: {language}")
-        print(f"  Voice clone: {ref_audio_path is not None}")
+        print(f"[TTS] Generating: '{text[:50]}...' (lang: {language})")
 
-        # Generate audio
-        if ref_audio_path and ref_text:
-            # Voice cloning mode
-            print(f"[F5-TTS] Cloning voice from: {ref_audio_path}")
+        # Create temp output file
+        output_path = tempfile.mktemp(suffix='.wav')
 
-            audio, sr = f5_model.infer(
-                ref_file=ref_audio_path,
+        # Generate speech
+        if ref_audio and ref_text:
+            print(f"[TTS] Using voice cloning with ref: {ref_audio}")
+            f5_model.infer(
+                ref_file=ref_audio,
                 ref_text=ref_text,
                 gen_text=text,
+                file_wave=output_path,
                 target_rms=0.1,
                 cross_fade_duration=0.15,
                 nfe_step=32,
+                speed=1.0
             )
         else:
-            # Use default voice
-            print(f"[F5-TTS] Using default voice")
-
-            audio, sr = f5_model.infer(
-                ref_file=None,  # Use default voice
-                ref_text="",
+            print(f"[TTS] Using default voice")
+            f5_model.infer(
                 gen_text=text,
+                file_wave=output_path,
                 target_rms=0.1,
                 nfe_step=32,
+                speed=1.0
             )
 
-        return audio, sr, None
-
-    except Exception as e:
-        print(f"[F5-TTS] Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, f"F5-TTS generation failed: {str(e)}"
-
-def apply_openvoice_cloning(source_audio_path, reference_audio_path, output_path):
-    """
-    Apply OpenVoice tone color conversion
-
-    Args:
-        source_audio_path: Path to generated TTS audio
-        reference_audio_path: Path to reference voice sample
-        output_path: Output path for cloned audio
-    """
-    global tone_converter
-
-    try:
-        # Lazy load if not initialized
-        if tone_converter is None:
-            if not initialize_openvoice():
-                return None, "OpenVoice model not available"
-
-        print(f"[OpenVoice] Applying voice cloning...")
-        from openvoice import se_extractor
-
-        # Extract tone from reference
-        reference_se, _ = se_extractor.get_se(
-            reference_audio_path,
-            tone_converter,
-            vad=True
-        )
-
-        # Convert tone
-        tone_converter.convert(
-            audio_src_path=source_audio_path,
-            src_se=None,  # Let it extract automatically
-            tgt_se=reference_se,
-            output_path=output_path,
-            message="@OpenVoice"
-        )
-
-        print(f"[OpenVoice] Voice cloned to: {output_path}")
+        print(f"[TTS] ✅ Generated: {output_path}")
         return output_path, None
 
     except Exception as e:
-        print(f"[OpenVoice] Error: {e}")
-        import traceback
+        error = f"TTS generation failed: {str(e)}"
+        print(f"[TTS] ❌ {error}")
         traceback.print_exc()
-        return None, f"OpenVoice cloning failed: {str(e)}"
+        return None, error
 
 def handler(job):
     """
-    RunPod Serverless Handler
-
-    Input format:
-    {
-        "text": "Hello world",
-        "language": "en",  // optional: en, zh, es, fr, de, etc.
-        "voice_clone_url": "https://...",  // optional: URL to voice sample
-        "voice_clone_text": "Transcript...",  // optional: transcript of voice sample
-        "use_openvoice": true,  // optional: use OpenVoice for better cloning
-        "output_format": "mp3"  // optional: mp3, wav (default: mp3)
-    }
+    RunPod serverless handler
+    NO sys.exit() - returns error dict instead
     """
+    job_input = job.get('input', {})
+
+    # Get inputs
+    text = job_input.get('text')
+    if not text:
+        return {"error": "text is required"}
+
+    language = job_input.get('language', 'en')
+    voice_clone_url = job_input.get('voice_clone_url')
+    voice_clone_text = job_input.get('voice_clone_text')
+    output_format = job_input.get('output_format', 'mp3')
+
+    print(f"\n[Job] Starting TTS generation")
+    print(f"[Job] Text length: {len(text)} chars")
+    print(f"[Job] Language: {language}")
+    print(f"[Job] Voice cloning: {'Yes' if voice_clone_url else 'No'}")
+
+    # Create temp directory
+    temp_dir = tempfile.mkdtemp()
+    ref_audio_path = None
+
     try:
-        job_input = job.get('input', {})
-        job_id = job.get('id', 'unknown')
-
-        print(f"[TTS] Processing job: {job_id}")
-
-        # Validate inputs
-        text = job_input.get('text')
-        if not text:
-            print("[TTS] ERROR: Missing text")
-            return {"error": "text is required"}
-
-        language = job_input.get('language', 'en')
-        voice_clone_url = job_input.get('voice_clone_url')
-        voice_clone_text = job_input.get('voice_clone_text')
-        use_openvoice = job_input.get('use_openvoice', False)
-        output_format = job_input.get('output_format', 'mp3')
-
-        # Create temp directory
-        temp_dir = tempfile.mkdtemp(prefix="tts_")
-        print(f"[TTS] Temp dir: {temp_dir}")
-
-        try:
-            # Download voice sample if provided
-            ref_audio_path = None
-            if voice_clone_url:
-                ref_audio_path = os.path.join(temp_dir, "reference.wav")
-                downloaded_ref, error = download_file(voice_clone_url, ref_audio_path)
-
-                if error:
-                    print(f"[TTS] ERROR: {error}")
-                    return {"error": f"Failed to download voice sample: {error}"}
-
-                ref_audio_path = downloaded_ref
-
-            # Generate audio with F5-TTS
-            audio, sample_rate, error = generate_f5_tts(
-                text=text,
-                ref_audio_path=ref_audio_path,
-                ref_text=voice_clone_text,
-                language=language
-            )
-
+        # Download reference audio if provided
+        if voice_clone_url:
+            ref_audio_path = os.path.join(temp_dir, 'ref_audio.wav')
+            downloaded_path, error = download_file(voice_clone_url, ref_audio_path)
             if error:
-                print(f"[TTS] ERROR: {error}")
-                return {"error": error}
+                return {"error": f"Failed to download voice sample: {error}"}
 
-            # Save F5-TTS output
-            f5_output = os.path.join(temp_dir, "f5_output.wav")
-            torchaudio.save(f5_output, audio, sample_rate)
+        # Generate TTS
+        audio_path, error = generate_tts(
+            text=text,
+            language=language,
+            ref_audio=ref_audio_path,
+            ref_text=voice_clone_text
+        )
 
-            # Apply OpenVoice cloning if requested
-            final_audio_path = f5_output
-            if use_openvoice and ref_audio_path:
-                print("[TTS] Applying OpenVoice enhancement...")
-                openvoice_output = os.path.join(temp_dir, "openvoice_output.wav")
+        if error:
+            return {"error": error}
 
-                cloned_path, error = apply_openvoice_cloning(
-                    source_audio_path=f5_output,
-                    reference_audio_path=ref_audio_path,
-                    output_path=openvoice_output
-                )
-
-                if error:
-                    print(f"[TTS] OpenVoice warning: {error}")
-                    # Continue with F5-TTS output
-                else:
-                    final_audio_path = cloned_path
-
-            # Convert to requested format
-            output_file = os.path.join(temp_dir, f"output.{output_format}")
-
-            if output_format == "mp3":
-                # Convert to MP3 using ffmpeg
-                import subprocess
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", final_audio_path,
-                    "-codec:a", "libmp3lame",
-                    "-qscale:a", "2",
-                    output_file
-                ]
-                subprocess.run(cmd, check=True, capture_output=True)
-            else:
-                # Keep as WAV
-                shutil.copy(final_audio_path, output_file)
-
-            # Upload to S3
-            bucket = os.getenv('RUNPOD_S3_BUCKET', 'flowsmartly-avatars')
-            object_name = f"tts/{job_id}.{output_format}"
-
-            audio_url, error = upload_to_s3(output_file, bucket, object_name)
-
-            if error:
-                print(f"[TTS] ERROR: {error}")
-                return {"error": error}
-
-            print(f"[TTS] ✅ Success: {audio_url}")
-
-            return {
-                "audio_url": audio_url,
-                "status": "completed",
-                "model": "f5-tts" + ("+openvoice" if use_openvoice else ""),
-                "language": language,
-                "format": output_format,
-                "job_id": job_id
-            }
-
-        finally:
-            # Cleanup
+        # Convert to requested format if needed
+        final_path = audio_path
+        if output_format != 'wav':
+            final_path = audio_path.replace('.wav', f'.{output_format}')
             try:
-                shutil.rmtree(temp_dir)
-                print(f"[TTS] Cleaned up: {temp_dir}")
-            except:
-                pass
+                from pydub import AudioSegment
+                audio = AudioSegment.from_wav(audio_path)
+                audio.export(final_path, format=output_format)
+                print(f"[Convert] ✅ Converted to {output_format}")
+            except Exception as e:
+                print(f"[Convert] ⚠️ Failed to convert to {output_format}: {e}")
+                final_path = audio_path
+
+        # Upload to S3
+        audio_url, error = upload_to_s3(final_path)
+        if error:
+            # If S3 fails, return local path (RunPod will handle)
+            print(f"[Job] ⚠️ S3 upload failed, returning local path")
+            audio_url = final_path
+
+        # Clean up
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+
+        print(f"[Job] ✅ Complete!")
+
+        return {
+            "audio_url": audio_url,
+            "status": "completed",
+            "language": language,
+            "text_length": len(text),
+            "voice_cloned": bool(voice_clone_url)
+        }
 
     except Exception as e:
-        print(f"[TTS] CRITICAL ERROR: {e}")
-        import traceback
+        # Clean up
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+
+        error_msg = f"Handler error: {str(e)}"
+        print(f"[Job] ❌ {error_msg}")
         traceback.print_exc()
-        return {"error": f"Handler error: {str(e)}"}
 
-# Startup check
+        return {"error": error_msg}
+
+# Initialize model at startup
+print("[TTS] Pre-loading F5-TTS model...")
+initialize_f5_tts()
+print("[TTS] Handler ready!")
+
+# Start RunPod handler
 if __name__ == "__main__":
-    print("[TTS] Starting RunPod Serverless Worker...")
-    print(f"[TTS] Python: {sys.version}")
-    print(f"[TTS] Workspace: {WORKSPACE}")
-
-    # Check CUDA
-    try:
-        import torch
-        print(f"[TTS] PyTorch: {torch.__version__}")
-        print(f"[TTS] CUDA Available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            print(f"[TTS] GPU: {torch.cuda.get_device_name(0)}")
-            print(f"[TTS] Compute: {torch.cuda.get_device_capability(0)}")
-    except:
-        print("[TTS] WARNING: PyTorch/CUDA check failed")
-
-    # Check S3 config
-    if os.getenv('RUNPOD_S3_ACCESS_KEY'):
-        print("[TTS] ✅ S3 credentials configured")
-    else:
-        print("[TTS] ⚠️ S3 credentials not found")
-
-    # Check models
-    print(f"[TTS] F5-TTS: {'✅ Ready' if f5_initialized else '⚠️ Will load on first request'}")
-    print(f"[TTS] OpenVoice: {'✅ Ready' if openvoice_initialized else '⚠️ Will load on first request'}")
-
-    print("[TTS] Ready to process jobs!")
-
-    # Start RunPod worker
+    print("[RunPod] Starting serverless handler...")
     runpod.serverless.start({"handler": handler})
