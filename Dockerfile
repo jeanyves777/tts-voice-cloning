@@ -1,7 +1,7 @@
 # Production TTS with F5-TTS + OpenVoice for RunPod
 # Multilingual voice generation and cloning
 
-FROM runpod/pytorch:2.2.0-py3.11-cuda12.1.1-devel-ubuntu22.04
+FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
 
 WORKDIR /workspace
 
