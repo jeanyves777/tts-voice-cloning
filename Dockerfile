@@ -35,10 +35,18 @@ RUN git clone https://github.com/SWivid/F5-TTS.git /workspace/F5-TTS && \
     pydub \
     soundfile
 
-# Install OpenVoice
+# Install OpenVoice dependencies manually (avoid requirements.txt issues)
 RUN git clone https://github.com/myshell-ai/OpenVoice.git /workspace/OpenVoice && \
     cd /workspace/OpenVoice && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir \
+    whisper-timestamped \
+    openai-whisper \
+    gradio \
+    librosa \
+    nltk \
+    pyrubberband \
+    pydub \
+    ffmpeg-python || echo "OpenVoice optional - will use F5-TTS only"
 
 # Install RunPod SDK and utilities
 RUN pip install --no-cache-dir \
@@ -49,23 +57,16 @@ RUN pip install --no-cache-dir \
     uvicorn \
     python-multipart
 
-# Download F5-TTS models
-RUN cd /workspace/F5-TTS && \
-    python3 -c "from f5_tts.infer.utils_infer import load_model; load_model('F5-TTS')" || \
-    echo "Models will download at first run"
-
-# Download OpenVoice models
-RUN cd /workspace/OpenVoice && \
-    mkdir -p checkpoints && \
-    wget -q https://myshell-public-repo-hosting.s3.amazonaws.com/openvoice/basespeakers/EN/en_default_se.pth -O checkpoints/base_speakers/EN/en_default_se.pth || \
-    echo "Models will download at first run"
+# Models will download at first run (avoid build-time downloads)
+RUN mkdir -p /workspace/.cache/huggingface && \
+    echo "Models will download at runtime"
 
 # Copy handler
 COPY handler.py /workspace/handler.py
 COPY voice_manager.py /workspace/voice_manager.py
 
 # Set environment variables
-ENV PYTHONPATH="/workspace/F5-TTS:/workspace/OpenVoice:${PYTHONPATH}"
+ENV PYTHONPATH="/workspace/F5-TTS:/workspace/OpenVoice"
 ENV HF_HOME="/workspace/.cache/huggingface"
 
 # Expose ports
