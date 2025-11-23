@@ -206,7 +206,7 @@ def handler(job):
         # Download reference audio if provided
         if voice_clone_url:
             ref_audio_path = os.path.join(temp_dir, 'ref_audio.wav')
-            downloaded_path, error = download_file(voice_clone_url, ref_audio_path)
+            ref_audio_path, error = download_file(voice_clone_url, ref_audio_path)
             if error:
                 return {"error": f"Failed to download voice sample: {error}"}
 
