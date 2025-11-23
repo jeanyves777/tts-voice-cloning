@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+.env
+*.md
+!README.md
+.DS_Store
+*.log
+*.wav
+*.mp3
+*.mp4
+.cache
+checkpoints/
+models/
