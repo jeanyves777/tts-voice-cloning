@@ -23,12 +23,13 @@ A production-ready Text-to-Speech system combining:
 - Name: `flowsmartly-tts-production`
 - Docker: Build from GitHub Dockerfile
 
-**GPU Configuration**:
+**GPU Configuration** (On-Demand Scaling):
 - GPU Types: RTX 3090, RTX 4090, A40, A6000
-- Workers Min: 1
-- Workers Max: 3
+- Workers Min: 0 (no idle workers = $0 cost when idle)
+- Workers Max: 5
 - Scaler Type: REQUEST_COUNT
 - Scaler Value: 1
+- Idle Timeout: 10 seconds
 
 **Environment Variables** (Set these in RunPod console):
 ```bash
