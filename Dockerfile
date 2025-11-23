@@ -1,5 +1,5 @@
-# Production TTS with F5-TTS + OpenVoice for RunPod
-# Multilingual voice generation and cloning
+# Simplified TTS with F5-TTS for RunPod
+# Start with F5-TTS only, add OpenVoice later
 
 FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
 
@@ -10,64 +10,48 @@ RUN apt-get update && apt-get install -y \
     git \
     ffmpeg \
     libsndfile1 \
-    libsox-dev \
-    sox \
-    espeak-ng \
     wget \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Upgrade pip
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Install F5-TTS
-RUN git clone https://github.com/SWivid/F5-TTS.git /workspace/F5-TTS && \
-    cd /workspace/F5-TTS && \
-    pip install --no-cache-dir -e . && \
-    pip install --no-cache-dir \
-    torch \
-    torchaudio \
+# Install core dependencies first
+RUN pip install --no-cache-dir \
+    torch==2.1.0 \
+    torchaudio==2.1.0 \
     transformers \
     accelerate \
-    cached_path \
     einops \
-    vocos \
     pydub \
-    soundfile
-
-# Install OpenVoice dependencies manually (avoid requirements.txt issues)
-RUN git clone https://github.com/myshell-ai/OpenVoice.git /workspace/OpenVoice && \
-    cd /workspace/OpenVoice && \
-    pip install --no-cache-dir \
-    whisper-timestamped \
-    openai-whisper \
-    gradio \
+    soundfile \
     librosa \
-    nltk \
-    pyrubberband \
-    pydub \
-    ffmpeg-python || echo "OpenVoice optional - will use F5-TTS only"
+    cached-path \
+    vocos
 
-# Install RunPod SDK and utilities
+# Install F5-TTS from source
+RUN git clone https://github.com/SWivid/F5-TTS.git /workspace/F5-TTS && \
+    cd /workspace/F5-TTS && \
+    pip install --no-cache-dir -e .
+
+# Install RunPod and S3 dependencies
 RUN pip install --no-cache-dir \
     runpod \
     boto3 \
-    requests \
-    fastapi \
-    uvicorn \
-    python-multipart
+    requests
 
-# Models will download at first run (avoid build-time downloads)
-RUN mkdir -p /workspace/.cache/huggingface && \
-    echo "Models will download at runtime"
-
-# Copy handler
+# Copy handler files
 COPY handler.py /workspace/handler.py
 COPY voice_manager.py /workspace/voice_manager.py
 
 # Set environment variables
-ENV PYTHONPATH="/workspace/F5-TTS:/workspace/OpenVoice"
+ENV PYTHONPATH="/workspace/F5-TTS"
 ENV HF_HOME="/workspace/.cache/huggingface"
+ENV TORCH_HOME="/workspace/.cache/torch"
+
+# Create cache directories
+RUN mkdir -p /workspace/.cache/huggingface /workspace/.cache/torch
 
 # Expose ports
 EXPOSE 8000
