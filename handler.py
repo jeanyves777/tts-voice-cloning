@@ -57,15 +57,9 @@ def initialize_f5_tts():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[F5-TTS] Using device: {device}")
 
-        # Initialize model
-        f5_model = F5TTS(
-            model_type="F5-TTS",
-            ckpt_file=None,  # Use default
-            vocab_file=None,  # Use default
-            ode_method="euler",
-            use_ema=True,
-            device=device
-        )
+        # Initialize model with default settings
+        # F5TTS() uses defaults: model_type="F5-TTS", ode_method="euler"
+        f5_model = F5TTS()
 
         print(f"[F5-TTS] ✅ Model loaded successfully")
         return True
