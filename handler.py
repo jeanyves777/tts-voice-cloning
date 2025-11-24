@@ -139,27 +139,35 @@ def generate_tts(text, language="en", ref_audio=None, ref_text=None):
         output_path = tempfile.mktemp(suffix='.wav')
 
         # Generate speech
+        # F5TTS.infer() actually has ref_file and ref_text as optional
+        # Let's use the simpler export_wav method for generation
+        print(f"[TTS] Generating audio...")
+
         if ref_audio and ref_text:
+            # Voice cloning mode
             print(f"[TTS] Using voice cloning with ref: {ref_audio}")
-            f5_model.infer(
+            audio, sample_rate = f5_model.infer(
                 ref_file=ref_audio,
                 ref_text=ref_text,
                 gen_text=text,
-                file_wave=output_path,
                 target_rms=0.1,
-                cross_fade_duration=0.15,
-                nfe_step=32,
-                speed=1.0
+                nfe_step=32
             )
         else:
+            # Default voice - use export_wav which doesn't need ref
             print(f"[TTS] Using default voice")
-            f5_model.infer(
+            audio, sample_rate = f5_model.export_wav(
                 gen_text=text,
                 file_wave=output_path,
                 target_rms=0.1,
-                nfe_step=32,
-                speed=1.0
+                nfe_step=32
             )
+            print(f"[TTS] ✅ Generated: {output_path}")
+            return output_path, None
+
+        # Save audio if using voice cloning
+        import soundfile as sf
+        sf.write(output_path, audio, sample_rate)
 
         print(f"[TTS] ✅ Generated: {output_path}")
         return output_path, None
